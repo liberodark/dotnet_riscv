@@ -1,0 +1,133 @@
+name: Build .NET SDK
+
+run-name: "Build .NET SDK : ${{ inputs.branch }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      fork:
+        description: 'dotnet VMR fork name'
+        required: true
+        type: string
+        default: dotnet
+      branch:
+        description: 'dotnet VMR branch or tag name'
+        required: true
+        type: string
+        default: v9.0.120
+      release:
+        description: 'publish release'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            libc: glibc
+            docker_tag: azurelinux-3.0-net10.0-cross-riscv64
+          - name: linux-musl
+            libc: musl
+            docker_tag: azurelinux-3.0-net10.0-cross-riscv64-musl
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+    - name: Maximize build space
+      uses: AdityaGarg8/remove-unwanted-software@v4.1
+      with:
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-cached-tools: 'true'
+
+    - name: Clone repository
+      run: |
+        git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
+
+    - name: Build
+      run: |
+        cat > "${{ github.workspace }}/dotnet/ci-build.sh" << 'EOS'
+        #!/usr/bin/env bash
+        set -euo pipefail
+        cd /dotnet
+        if [ -f ./prep-source-build.sh ]; then
+          ./prep-source-build.sh
+          export DISABLE_CROSSGEN=true
+          sed -i "s|'\$(DotNetBuildOrchestrator)' == 'true'\">true</BundleNativeAotCompiler>|'\$(DotNetBuildOrchestrator)' == 'true' and '\$(Architecture)' != 'riscv64'\">true</BundleNativeAotCompiler>|" \
+            src/sdk/src/Installer/redist-installer/redist-installer.csproj
+          grep -q "riscv64" src/sdk/src/Installer/redist-installer/redist-installer.csproj
+          ./build.sh --clean-while-building -sb --rid ${TARGET_NAME}-riscv64 \
+            /p:TargetOS=linux /p:TargetArchitecture=riscv64 /p:CrossBuild=true
+        else
+          ./build.sh --clean-while-building --prep -sb --os ${TARGET_NAME} --rid ${TARGET_NAME}-riscv64 --arch riscv64 \
+            -p:OfficialBuildId=$(date +%Y%m%d).99
+        fi
+        EOS
+        chmod +x "${{ github.workspace }}/dotnet/ci-build.sh"
+        docker run --platform linux/amd64 --rm -v${{ github.workspace }}/dotnet:/dotnet -w /dotnet \
+          -e ROOTFS_DIR=/crossrootfs/riscv64 -e TARGET_NAME=${{ matrix.name }} \
+          mcr.microsoft.com/dotnet-buildtools/prereqs:${{ matrix.docker_tag }} \
+          bash /dotnet/ci-build.sh
+
+    - name: List assets directory
+      run: |
+        find "${{ github.workspace }}/dotnet/artifacts/assets"
+
+    - name: Attest build provenance
+      uses: actions/attest-build-provenance@v2
+      with:
+        subject-path: ${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/*/dotnet-sdk-*.tar.gz
+
+    - name: Upload .NET
+      uses: actions/upload-artifact@v4
+      with:
+        name: dotnet-sdk-${{ matrix.name }}
+        path: |
+          ${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/*/dotnet-sdk-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always() && inputs.release
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download artifacts
+      if: always()
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Make release
+      run: |
+        sdk_paths=$(find "${{ github.workspace }}/artifacts" -name 'dotnet-sdk-*.tar.gz')
+        [ -n "$sdk_paths" ] || { echo "no sdk tarballs produced"; exit 1; }
+
+        artifacts=""
+        tag_name=""
+
+        for sdk_path in $sdk_paths; do
+          sdk_filename=$(basename "$sdk_path")
+          sdk_version=$(echo "$sdk_filename" | sed -E 's/dotnet-sdk-([^-]+(-[^-]+)*)-linux-.+\.tar\.gz/\1/')
+          artifacts="$artifacts $sdk_path"
+          tag_name="$sdk_version"
+        done
+
+        echo "tag_name: $tag_name"
+        echo "artifacts: $artifacts"
+
+        gh release create "$tag_name" $artifacts --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "$tag_name" --notes "$tag_name"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
