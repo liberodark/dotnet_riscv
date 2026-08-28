@@ -1,0 +1,8 @@
+name: runner-test
+on: workflow_dispatch
+jobs:
+  hello:
+    runs-on: [self-hosted, riscv64]
+    steps:
+      - run: uname -a
+      - run: nix run nixpkgs#hello 2>/dev/null || echo "hello from the K3"
